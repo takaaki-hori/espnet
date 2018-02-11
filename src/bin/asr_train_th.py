@@ -378,8 +378,10 @@ def main():
     # use determinisitic computation or not
     if args.debugmode < 1:
         chainer.config.cudnn_deterministic = False
+        torch.backends.cudnn.deterministic = False
         logging.info('chainer cudnn deterministic is disabled')
     else:
+        torch.backends.cudnn.deterministic = True
         chainer.config.cudnn_deterministic = True
     # load dictionary for debug log
     if args.dict is not None:
