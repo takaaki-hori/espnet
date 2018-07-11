@@ -33,6 +33,7 @@ CTC_LOSS_THRESHOLD = 10000
 CTC_SCORING_RATIO = 1.5
 MAX_DECODER_OUTPUT = 5
 
+torch_is_old = torch.__version__.startswith("0.3.")
 
 def to_cuda(m, x):
     assert isinstance(m, torch.nn.Module)
@@ -144,6 +145,72 @@ class Loss(torch.nn.Module):
 <<<<<<< 78b050f7b596c397a4aa46909c39702a8016c03f
 def pad_list(xs, pad_value):
 =======
+class ExpectedLoss(torch.nn.Module):
+    def __init__(self, predictor, args, loss_fn=None):
+        super(ExpectedLoss, self).__init__()
+        self.mtlalpha = args.mtlalpha
+        self.loss = None
+        self.accuracy = None
+        self.predictor = predictor
+        self.verbose = args.verbose
+        self.char_list = args.char_list
+        self.reporter = Reporter()
+        self.loss_fn = loss_fn
+        self.n_samples_per_input = args.n_samples_per_input
+        self.maxlenratio = args.sample_maxlenratio
+        self.minlenratio = args.sample_minlenratio
+        self.sample_scaling = args.sample_scaling
+
+    def forward(self, x):
+        '''Loss forward
+
+        :param x:
+        :return:
+        '''
+        # sample output sequence with the current model
+        loss_ctc, loss_att, ys = self.predictor.generate(x,
+                                         n_samples_per_input=self.n_samples_per_input,
+                                         maxlenratio=self.maxlenratio,
+                                         minlenratio=self.minlenratio)
+        acc = 0.
+        loss = None
+        alpha = self.mtlalpha
+        if alpha == 0:
+            loss = loss_att
+            loss_att_data = loss_att.data[0] if torch_is_old else float(loss_att)
+            loss_ctc_data = None
+        elif alpha == 1:
+            loss = loss_ctc
+            loss_att_data = None
+            loss_ctc_data = loss_ctc.data[0] if torch_is_old else float(loss_ctc)
+        else:
+            loss = alpha * loss_ctc + (1 - alpha) * loss_att
+            loss_att_data = loss_att.data[0] if torch_is_old else float(loss_att)
+            loss_ctc_data = loss_ctc.data[0] if torch_is_old else float(loss_ctc)
+
+        batch = int(len(loss.data) / self.n_samples_per_input)
+        # loss -> posterior probs
+        logprob = -loss.data.view(batch, self.n_samples_per_input)
+        prob = torch.exp((logprob - torch.max(logprob, dim=1, keepdim=True)[0]) * self.sample_scaling)
+        prob /= torch.sum(prob, dim=1, keepdim=True)
+        if self.verbose > 0 and self.char_list is not None:
+            for i in six.moves.range(batch):
+                for j in six.moves.range(self.n_samples_per_input):
+                    y_str = "".join([self.char_list[int(idx)] for idx in ys[i * self.n_samples_per_input + j]])
+                    print "generate[%d,%d]: %.4f %.4f " % (i, j, logprob[i, j], prob[i,j]) + y_str
+        # compute expected loss with another loss function
+        #self.loss = F.sum(self.loss_fn(ys) * prob_data) / batch
+        self.loss = torch.sum(loss * Variable(prob.view(-1))) / batch
+
+        loss_data = self.loss.data[0] if torch_is_old else float(self.loss)
+        if loss_data < CTC_LOSS_THRESHOLD and not math.isnan(loss_data):
+            self.reporter.report(loss_ctc_data, loss_att_data, acc, loss_data)
+        else:
+            logging.warning('loss (=%f) is not correct', self.loss.data)
+
+        return self.loss
+
+
 class ExpectedLoss(torch.nn.Module):
     def __init__(self, predictor, args, loss_fn=None):
         super(ExpectedLoss, self).__init__()
