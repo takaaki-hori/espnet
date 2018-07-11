@@ -30,6 +30,7 @@ CTC_LOSS_THRESHOLD = 10000
 CTC_SCORING_RATIO = 1.5
 MAX_DECODER_OUTPUT = 5
 
+torch_is_old = torch.__version__.startswith("0.3.")
 
 def to_cuda(m, x):
     assert isinstance(m, torch.nn.Module)
@@ -131,6 +132,72 @@ class Loss(torch.nn.Module):
 
         if self.loss.data[0] < CTC_LOSS_THRESHOLD and not math.isnan(self.loss.data[0]):
             self.reporter.report(loss_ctc_data, loss_att_data, acc, self.loss.data[0])
+        else:
+            logging.warning('loss (=%f) is not correct', self.loss.data)
+
+        return self.loss
+
+
+class ExpectedLoss(torch.nn.Module):
+    def __init__(self, predictor, args, loss_fn=None):
+        super(ExpectedLoss, self).__init__()
+        self.mtlalpha = args.mtlalpha
+        self.loss = None
+        self.accuracy = None
+        self.predictor = predictor
+        self.verbose = args.verbose
+        self.char_list = args.char_list
+        self.reporter = Reporter()
+        self.loss_fn = loss_fn
+        self.n_samples_per_input = args.n_samples_per_input
+        self.maxlenratio = args.sample_maxlenratio
+        self.minlenratio = args.sample_minlenratio
+        self.sample_scaling = args.sample_scaling
+
+    def forward(self, x):
+        '''Loss forward
+
+        :param x:
+        :return:
+        '''
+        # sample output sequence with the current model
+        loss_ctc, loss_att, ys = self.predictor.generate(x,
+                                         n_samples_per_input=self.n_samples_per_input,
+                                         maxlenratio=self.maxlenratio,
+                                         minlenratio=self.minlenratio)
+        acc = 0.
+        loss = None
+        alpha = self.mtlalpha
+        if alpha == 0:
+            loss = loss_att
+            loss_att_data = loss_att.data[0] if torch_is_old else float(loss_att)
+            loss_ctc_data = None
+        elif alpha == 1:
+            loss = loss_ctc
+            loss_att_data = None
+            loss_ctc_data = loss_ctc.data[0] if torch_is_old else float(loss_ctc)
+        else:
+            loss = alpha * loss_ctc + (1 - alpha) * loss_att
+            loss_att_data = loss_att.data[0] if torch_is_old else float(loss_att)
+            loss_ctc_data = loss_ctc.data[0] if torch_is_old else float(loss_ctc)
+
+        batch = int(len(loss.data) / self.n_samples_per_input)
+        # loss -> posterior probs
+        logprob = -loss.data.view(batch, self.n_samples_per_input)
+        prob = torch.exp((logprob - torch.max(logprob, dim=1, keepdim=True)[0]) * self.sample_scaling)
+        prob /= torch.sum(prob, dim=1, keepdim=True)
+        if self.verbose > 0 and self.char_list is not None:
+            for i in six.moves.range(batch):
+                for j in six.moves.range(self.n_samples_per_input):
+                    y_str = "".join([self.char_list[int(idx)] for idx in ys[i * self.n_samples_per_input + j]])
+                    print "generate[%d,%d]: %.4f %.4f " % (i, j, logprob[i, j], prob[i,j]) + y_str
+        # compute expected loss with another loss function
+        #self.loss = F.sum(self.loss_fn(ys) * prob_data) / batch
+        self.loss = torch.sum(loss * Variable(prob.view(-1))) / batch
+
+        loss_data = self.loss.data[0] if torch_is_old else float(self.loss)
+        if loss_data < CTC_LOSS_THRESHOLD and not math.isnan(loss_data):
+            self.reporter.report(loss_ctc_data, loss_att_data, acc, loss_data)
         else:
             logging.warning('loss (=%f) is not correct', self.loss.data)
 
@@ -354,6 +421,52 @@ class E2E(torch.nn.Module):
             self.train()
         return y
 
+    # x[i]: ('utt_id', {'ilen':'xxx',...}})
+    def generate(self, data, n_samples_per_input=10, maxlenratio=1.0, minlenratio=0.3):
+        '''E2E forward
+
+        :param data:
+        :return:
+        '''
+        # utt list of frame x dim
+        xs = [d[1]['feat'] for d in data]
+        # remove 0-output-length utterances
+        tids = [d[1]['output'][0]['tokenid'].split() for d in data]
+        filtered_index = filter(lambda i: len(tids[i]) > 0, range(len(xs)))
+        sorted_index = sorted(filtered_index, key=lambda i: -len(xs[i]))
+        if len(sorted_index) != len(xs):
+            logging.warning('Target sequences include empty tokenid (batch %d -> %d).' % (
+                len(xs), len(sorted_index)))
+        xs = [xs[i] for i in sorted_index]
+
+        # subsample frame
+        xs = [xx[::self.subsample[0], :] for xx in xs]
+        ilens = np.fromiter((xx.shape[0] for xx in xs), dtype=np.int64)
+        if self.training:
+            hs = [to_cuda(self, Variable(torch.from_numpy(xx))) for xx in xs]
+        else:
+            hs = [to_cuda(self, Variable(torch.from_numpy(xx), volatile=True)) for xx in xs]
+
+        # 1. encoder
+        xpad = pad_list(hs)
+        hpad, hlens = self.enc(xpad, ilens)
+        # expand encoder states by n_sample_per_input
+        hpad, hlens = mask_by_length_and_multiply(hpad, hlens, 0, n_samples_per_input)
+        # 2. attention-based generation
+        if self.mtlalpha == 1:
+            raise Exception('CTC-only mode (mtlalpha=1) is not supported.')
+
+        loss_att, ys = self.dec.generate(hpad, hlens, maxlenratio=maxlenratio, minlenratio=minlenratio)
+        # 3. CTC loss
+        ys = [to_cuda(self, Variable(torch.from_numpy(y))) for y in ys]
+        loss_ctc = None
+        if self.mtlalpha == 0:
+            loss_ctc = None
+        else:
+            loss_ctc = self.ctc(hpad, hlens, ys, reduce=False)
+
+        return loss_ctc, loss_att, ys
+
     def calculate_all_attentions(self, data):
         '''E2E attention calculation
 
@@ -398,7 +511,7 @@ class E2E(torch.nn.Module):
 # ------------- CTC Network --------------------------------------------------------------------------------------------
 class _ChainerLikeCTC(warp_ctc._CTC):
     @staticmethod
-    def forward(ctx, acts, labels, act_lens, label_lens):
+    def forward(ctx, acts, labels, act_lens, label_lens, reduce):
         is_cuda = True if acts.is_cuda else False
         acts = acts.contiguous()
         loss_func = warp_ctc.gpu_ctc if is_cuda else warp_ctc.cpu_ctc
@@ -413,14 +526,17 @@ class _ChainerLikeCTC(warp_ctc._CTC):
                   minibatch_size,
                   costs)
         # modified only here from original
-        costs = torch.FloatTensor([costs.sum()]) / acts.size(1)
-        ctx.grads = Variable(grads)
-        ctx.grads /= ctx.grads.size(1)
+        if reduce:
+            costs = torch.FloatTensor([costs.sum()]) / acts.size(1)
+            ctx.grads = Variable(grads)
+            ctx.grads /= ctx.grads.size(1)
+        else:
+            ctx.grads = Variable(grads)
 
         return costs
 
 
-def chainer_like_ctc_loss(acts, labels, act_lens, label_lens):
+def chainer_like_ctc_loss(acts, labels, act_lens, label_lens, reduce=True):
     """Chainer like CTC Loss
 
     acts: Tensor of (seqLength x batch x outputDim) containing output from network
@@ -433,7 +549,7 @@ def chainer_like_ctc_loss(acts, labels, act_lens, label_lens):
     _assert_no_grad(labels)
     _assert_no_grad(act_lens)
     _assert_no_grad(label_lens)
-    return _ChainerLikeCTC.apply(acts, labels, act_lens, label_lens)
+    return _ChainerLikeCTC.apply(acts, labels, act_lens, label_lens, reduce)
 
 
 class CTC(torch.nn.Module):
@@ -444,7 +560,7 @@ class CTC(torch.nn.Module):
         self.ctc_lo = torch.nn.Linear(eprojs, odim)
         self.loss_fn = chainer_like_ctc_loss  # CTCLoss()
 
-    def forward(self, hpad, ilens, ys):
+    def forward(self, hpad, ilens, ys, reduce=True):
         '''CTC forward
 
         :param hs:
@@ -470,7 +586,7 @@ class CTC(torch.nn.Module):
         # get ctc loss
         # expected shape of seqLength x batchSize x alphabet_size
         y_hat = y_hat.transpose(0, 1)
-        self.loss = to_cuda(self, self.loss_fn(y_hat, y_true, ilens, olens))
+        self.loss = to_cuda(self, self.loss_fn(y_hat, y_true, ilens, olens, reduce=reduce))
         logging.info('ctc loss:' + str(self.loss.data[0]))
 
         return self.loss
@@ -491,6 +607,16 @@ def mask_by_length(xs, length, fill=0):
         ret[i, :l] = xs[i, :l]
     return ret
 
+
+def mask_by_length_and_multiply(xs, length, fill=0, msize=1):
+    assert xs.size(0) == len(length)
+    ret = Variable(xs.data.new(xs.size(0) * msize, xs.size(1), xs.size(2)).fill_(fill))
+    k = 0
+    for i, l in enumerate(length):
+        for j in range(msize):
+            ret[k, :l] = xs[i, :l]
+            k += 1
+    return ret, length * msize
 
 # ------------- Attention Network --------------------------------------------------------------------------------------
 class NoAtt(torch.nn.Module):
@@ -1895,6 +2021,90 @@ class Decoder(torch.nn.Module):
 
         # remove sos
         return nbest_hyps
+
+    def generate(self, hpad, hlen, maxlenratio=1.0, minlenratio=0.3, rnnlm=None):
+        '''Decoder generate sequence
+
+        :param hs:
+        :return:
+        '''
+        # get dim, length info
+        # initialization
+        self.loss = None
+        n_samples = len(hlen)
+        c_list = [self.zero_state(hpad)]
+        z_list = [self.zero_state(hpad)]
+        for l in six.moves.range(1, self.dlayers):
+            c_list.append(self.zero_state(hpad))
+            z_list.append(self.zero_state(hpad))
+        att_w = None
+        z_all = []
+        self.att.reset()  # reset pre-computation of h
+
+        # preprate sos
+        if maxlenratio == 0:
+            maxlen = max(hlen)
+        else:
+            # maxlen >= 1
+            maxlen = max(1, int(maxlenratio * max(hlen)))
+        minlen = int(minlenratio * min(hlen))
+        odim = self.eos + 1
+        # prepare the first label <sos>
+        y = to_cuda(self, Variable(torch.from_numpy(np.full(n_samples, self.sos, dtype=np.int64))))
+        indices = np.array(range(odim), dtype=np.int32)
+        y_gen = np.full((maxlen, n_samples), self.ignore_id, dtype=np.int64)
+        not_ended = np.array([True] * n_samples, dtype=np.bool_)
+        # make a mask to avoid sentence end prediction
+        no_end_mask = np.zeros((1, odim), dtype=np.float32)
+        no_end_mask[0, self.eos] = -1.0e+10
+        no_end_mask = to_cuda(self, Variable(torch.from_numpy(no_end_mask)))
+        # loop for an output sequence
+        loss_list = []
+        for i in six.moves.range(maxlen):
+            if i > 0:
+                yg = y_gen[i-1]
+                yg[yg == -1] = 0
+                y = to_cuda(self, Variable(torch.from_numpy(yg)))
+            ey = self.embed(y)  # utt x zdim
+            att_c, att_w = self.att(hpad, hlen, z_list[0], att_w)
+            ey = torch.cat((ey, att_c), dim=1)  # n_samples x (zdim + hdim)
+            z_list[0], c_list[0] = self.decoder[0](ey, (z_list[0], c_list[0]))
+            for l in six.moves.range(1, self.dlayers):
+                z_list[l], c_list[l] = self.decoder[l](
+                    z_list[l - 1], (z_list[l], c_list[l]))
+            oy = self.output(z_list[-1])
+            if i <= minlen:  # exclude <eos> while sequence is short
+                oy += no_end_mask
+            sy = F.softmax(oy, dim=1).data.cpu().numpy()
+
+            if i < maxlen-1:
+                for j in six.moves.range(n_samples):
+                    if not_ended[j]:
+                        y_gen[i, j] = np.random.choice(indices, 1, p=sy[j]) # or argmax in some cases
+                not_ended &= y_gen[i, :]!=self.eos
+            else:
+                y_gen[i, not_ended] = self.eos
+            del sy
+
+            t = to_cuda(self, Variable(torch.from_numpy(y_gen[i])))
+            ce_loss = F.cross_entropy(oy, t, ignore_index=self.ignore_id, size_average=False, reduce=False)
+            loss_list.append(ce_loss)
+
+        sample_loss = torch.sum(torch.stack(loss_list), dim=0)
+        # show predicted character sequence for debug
+        y_list = []
+        for i in six.moves.range(n_samples):
+            y_seq = []
+            for j in six.moves.range(maxlen):
+                y_seq.append(y_gen[j, i])
+                if y_gen[j, i] == self.eos:
+                    break
+            y_list.append(np.array(y_seq, dtype=np.int32))
+            if self.verbose > 0 and self.char_list is not None:
+                y_str = "".join([self.char_list[int(idx)] for idx in y_seq])
+                logging.info("generation[%d]: %.4f " % (i, sample_loss.data[i]) + y_str)
+
+        return sample_loss, y_list
 
     def calculate_all_attentions(self, hpad, hlen, ys):
         '''Calculate all of attentions
