@@ -32,6 +32,7 @@ from asr_utils import make_batchset
 from asr_utils import PlotAttentionReport
 from asr_utils import restore_snapshot
 from e2e_asr_attctc_th import E2E
+from e2e_asr_attctc_th import ExpectedLoss
 from e2e_asr_attctc_th import Loss
 from e2e_asr_attctc_th import torch_is_old
 
@@ -221,6 +222,15 @@ def train(args):
     # specify model architecture
     e2e = E2E(idim, odim, args)
     model = Loss(e2e, args.mtlalpha)
+    if args.prior_model:
+        model.load_state_dict(torch.load(args.prior_model))
+    if args.expected_loss:
+        # need to specify a loss function (loss_fn) to compute the expected loss
+        if args.expected_loss == 'tts':
+            loss_fn=None
+        else:
+            raise NotImplemented('Unknown expected loss: %s' % args.expected_loss)
+        model = ExpectedLoss(model.predictor, args, loss_fn=loss_fn)
 
     # write model config
     if not os.path.exists(args.outdir):
